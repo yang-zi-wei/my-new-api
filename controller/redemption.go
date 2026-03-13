@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"unicode/utf8"
@@ -184,4 +185,40 @@ func validateExpiredTime(c *gin.Context, expired int64) (bool, string) {
 		return false, i18n.T(c, i18n.MsgRedemptionExpireTimeInvalid)
 	}
 	return true, ""
+}
+
+// AdminTopUp allows an admin to redeem a code on behalf of a specified user.
+func AdminTopUp(c *gin.Context) {
+	var req struct {
+		Key    string `json:"key"`
+		UserID int    `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if req.Key == "" || req.UserID == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "key and user_id are required",
+		})
+		return
+	}
+	quota, err := model.Redeem(req.Key, req.UserID)
+	if err != nil {
+		if errors.Is(err, model.ErrRedeemFailed) {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "redeem failed: invalid or used code",
+			})
+			return
+		}
+		common.ApiError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    quota,
+	})
 }
