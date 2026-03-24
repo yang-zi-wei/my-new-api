@@ -289,12 +289,18 @@ func handleTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycom
 	var usage *dto.Usage
 	contentType := "audio/mpeg"
 	headerWritten := false
+	lastEventType := ""
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if strings.HasPrefix(line, "event:") {
+			lastEventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
 
 		if !strings.HasPrefix(line, "data:") {
 			continue
@@ -315,22 +321,40 @@ func handleTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycom
 			), nil
 		}
 
-		audioBytes, audioType := aliResp.Output.extractAudioBytes()
-		if audioBytes != nil && len(audioBytes) > 0 {
-			if !headerWritten {
-				if audioType != "" {
-					contentType = "audio/" + audioType
-				}
-				c.Header("Content-Type", contentType)
-				c.Status(http.StatusOK)
-				headerWritten = true
+		shouldSkipAudio := false
+		// 标准阿里 qwen-tts：event:task-finished 包含完整音频，跳过
+		if lastEventType == "task-finished" {
+			shouldSkipAudio = true
+		}
+		// MiniMax SSE：output.data.status=2 表示完整音频（以 ID3 头开始）
+		// 如果已写入增量块(status=1)，则跳过 status=2 以避免音频翻倍
+		if len(aliResp.Output.DataRaw) > 0 && headerWritten {
+			var dataStatus struct {
+				Status int `json:"status"`
 			}
+			if json.Unmarshal(aliResp.Output.DataRaw, &dataStatus) == nil && dataStatus.Status == 2 {
+				shouldSkipAudio = true
+			}
+		}
 
-			if _, err := c.Writer.Write(audioBytes); err != nil {
-				logger.LogError(c, "ali tts stream write error: "+err.Error())
-				break
+		if !shouldSkipAudio {
+			audioBytes, audioType := aliResp.Output.extractAudioBytes()
+			if audioBytes != nil && len(audioBytes) > 0 {
+				if !headerWritten {
+					if audioType != "" {
+						contentType = "audio/" + audioType
+					}
+					c.Header("Content-Type", contentType)
+					c.Status(http.StatusOK)
+					headerWritten = true
+				}
+
+				if _, err := c.Writer.Write(audioBytes); err != nil {
+					logger.LogError(c, "ali tts stream write error: "+err.Error())
+					break
+				}
+				c.Writer.Flush()
 			}
-			c.Writer.Flush()
 		}
 
 		if aliResp.Usage.Characters > 0 || aliResp.Usage.InputTokens > 0 || aliResp.Usage.TotalTokens > 0 {
