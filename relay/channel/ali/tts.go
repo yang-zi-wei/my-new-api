@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,14 +43,83 @@ type AliTTSResponse struct {
 	AliError
 }
 
+// AliTTSOutput handles multiple DashScope response formats:
+//   - Standard Ali (qwen-tts): output.audio = {"data":"base64...","type":"wav"}
+//   - MiniMax format 1:        output.data  = {"audio":"hex-encoded-mp3"}
+//   - MiniMax format 2:        output.audio = "hex-encoded-mp3"
 type AliTTSOutput struct {
-	Audio AliTTSAudio `json:"audio"`
+	AudioRaw json.RawMessage `json:"audio,omitempty"`
+	DataRaw  json.RawMessage `json:"data,omitempty"`
 }
 
 type AliTTSAudio struct {
 	URL  string `json:"url,omitempty"`
 	Data string `json:"data,omitempty"`
 	Type string `json:"type,omitempty"`
+}
+
+func (o *AliTTSOutput) extractAudioBytes() ([]byte, string) {
+	// Standard Ali: output.audio is object {"data":"base64...","type":"..."}
+	if len(o.AudioRaw) > 0 && o.AudioRaw[0] == '{' {
+		var audioObj AliTTSAudio
+		if err := json.Unmarshal(o.AudioRaw, &audioObj); err == nil {
+			if audioObj.URL != "" {
+				return nil, audioObj.Type
+			}
+			if audioObj.Data != "" {
+				decoded, err := base64.StdEncoding.DecodeString(audioObj.Data)
+				if err == nil {
+					return decoded, audioObj.Type
+				}
+			}
+		}
+	}
+
+	// MiniMax format 2: output.audio is a hex string
+	if len(o.AudioRaw) > 0 && o.AudioRaw[0] == '"' {
+		var audioStr string
+		if err := json.Unmarshal(o.AudioRaw, &audioStr); err == nil && audioStr != "" {
+			decoded, err := hex.DecodeString(audioStr)
+			if err == nil && len(decoded) > 0 {
+				return decoded, "mpeg"
+			}
+		}
+	}
+
+	// MiniMax format 1: output.data = {"audio":"hex..."}
+	if len(o.DataRaw) > 0 && o.DataRaw[0] == '{' {
+		var dataObj struct {
+			Audio string `json:"audio"`
+		}
+		if err := json.Unmarshal(o.DataRaw, &dataObj); err == nil && dataObj.Audio != "" {
+			decoded, err := hex.DecodeString(dataObj.Audio)
+			if err == nil && len(decoded) > 0 {
+				return decoded, "mpeg"
+			}
+		}
+	}
+
+	return nil, ""
+}
+
+func (o *AliTTSOutput) extractAudioURL() string {
+	if len(o.AudioRaw) > 0 && o.AudioRaw[0] == '{' {
+		var audioObj AliTTSAudio
+		if err := json.Unmarshal(o.AudioRaw, &audioObj); err == nil {
+			return audioObj.URL
+		}
+	}
+	return ""
+}
+
+func (o *AliTTSOutput) extractAudioType() string {
+	if len(o.AudioRaw) > 0 && o.AudioRaw[0] == '{' {
+		var audioObj AliTTSAudio
+		if err := json.Unmarshal(o.AudioRaw, &audioObj); err == nil {
+			return audioObj.Type
+		}
+	}
+	return ""
 }
 
 type AliTTSUsage struct {
@@ -58,9 +129,20 @@ type AliTTSUsage struct {
 	TotalTokens  int `json:"total_tokens"`
 }
 
+func isMiniMaxModel(model string) bool {
+	lower := strings.ToLower(model)
+	return strings.Contains(lower, "minimax") || strings.HasPrefix(lower, "speech-")
+}
+
 func convertAudioRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	modelName := info.UpstreamModelName
+
+	if isMiniMaxModel(modelName) {
+		return convertMiniMaxAudioRequest(modelName, request)
+	}
+
 	aliRequest := AliTTSRequest{
-		Model: info.UpstreamModelName,
+		Model: modelName,
 		Input: AliTTSInput{
 			Text:  request.Input,
 			Voice: request.Voice,
@@ -71,7 +153,6 @@ func convertAudioRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dt
 		aliRequest.Input.Voice = "Cherry"
 	}
 
-	// Allow metadata to overlay custom fields (e.g. language_type, parameters)
 	if len(request.Metadata) > 0 {
 		if err := common.Unmarshal(request.Metadata, &aliRequest); err != nil {
 			return nil, fmt.Errorf("error unmarshalling metadata to ali tts request: %w", err)
@@ -81,6 +162,43 @@ func convertAudioRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dt
 	jsonData, err := common.Marshal(aliRequest)
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling ali tts request: %w", err)
+	}
+
+	return bytes.NewReader(jsonData), nil
+}
+
+func convertMiniMaxAudioRequest(model string, request dto.AudioRequest) (io.Reader, error) {
+	voice := request.Voice
+	if voice == "" {
+		voice = "female-shaonv"
+	}
+
+	speed := 1.0
+	if request.Speed != nil {
+		speed = *request.Speed
+	}
+
+	reqBody := map[string]interface{}{
+		"model": model,
+		"input": map[string]interface{}{
+			"text": request.Input,
+			"voice_setting": map[string]interface{}{
+				"voice_id": voice,
+				"speed":    speed,
+				"vol":      1.0,
+				"pitch":    0,
+			},
+			"audio_setting": map[string]interface{}{
+				"sample_rate": 24000,
+				"format":      "mp3",
+				"channel":     1,
+			},
+		},
+	}
+
+	jsonData, err := common.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling minimax tts request: %w", err)
 	}
 
 	return bytes.NewReader(jsonData), nil
@@ -119,15 +237,26 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, _ *relaycommon.Relay
 		), nil
 	}
 
-	audioURL := aliResp.Output.Audio.URL
+	// Try inline audio first (MiniMax returns audio data directly)
+	audioBytes, audioType := aliResp.Output.extractAudioBytes()
+	if audioBytes != nil && len(audioBytes) > 0 {
+		contentType := "audio/mpeg"
+		if audioType != "" {
+			contentType = "audio/" + audioType
+		}
+		c.Data(http.StatusOK, contentType, audioBytes)
+		return nil, buildTTSUsage(aliResp.Usage)
+	}
+
+	// Standard Ali: download from URL
+	audioURL := aliResp.Output.extractAudioURL()
 	if audioURL == "" {
 		return types.NewOpenAIError(
-			fmt.Errorf("no audio url in ali tts response"),
+			fmt.Errorf("no audio data or url in ali tts response"),
 			types.ErrorCodeBadResponse, http.StatusBadRequest,
 		), nil
 	}
 
-	// Download the audio from the URL
 	downloadResp, err := service.DoDownloadRequest(audioURL, "ali tts audio download")
 	if err != nil {
 		return types.NewOpenAIError(
@@ -146,8 +275,8 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, _ *relaycommon.Relay
 	}
 
 	contentType := "audio/mpeg"
-	if aliResp.Output.Audio.Type != "" {
-		contentType = "audio/" + aliResp.Output.Audio.Type
+	if t := aliResp.Output.extractAudioType(); t != "" {
+		contentType = "audio/" + t
 	}
 	c.Data(http.StatusOK, contentType, audioData)
 
@@ -162,7 +291,6 @@ func handleTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycom
 	headerWritten := false
 
 	scanner := bufio.NewScanner(resp.Body)
-	// Increase buffer size for base64 audio chunks
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
 	for scanner.Scan() {
@@ -187,17 +315,11 @@ func handleTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycom
 			), nil
 		}
 
-		// Write audio chunk
-		if aliResp.Output.Audio.Data != "" {
-			audioBytes, err := base64.StdEncoding.DecodeString(aliResp.Output.Audio.Data)
-			if err != nil {
-				logger.LogError(c, "ali tts stream base64 decode error: "+err.Error())
-				continue
-			}
-
+		audioBytes, audioType := aliResp.Output.extractAudioBytes()
+		if audioBytes != nil && len(audioBytes) > 0 {
 			if !headerWritten {
-				if aliResp.Output.Audio.Type != "" {
-					contentType = "audio/" + aliResp.Output.Audio.Type
+				if audioType != "" {
+					contentType = "audio/" + audioType
 				}
 				c.Header("Content-Type", contentType)
 				c.Status(http.StatusOK)
@@ -211,7 +333,6 @@ func handleTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycom
 			c.Writer.Flush()
 		}
 
-		// Extract usage from final event
 		if aliResp.Usage.Characters > 0 || aliResp.Usage.InputTokens > 0 || aliResp.Usage.TotalTokens > 0 {
 			usage = buildTTSUsage(aliResp.Usage)
 		}
